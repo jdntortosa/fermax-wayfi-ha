@@ -18,8 +18,8 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import CONF_NUM_DOORS, CONF_PIN, DEFAULT_PORT, DOMAIN, LOCK_CANDADO
-from .protocol import derive_device_password, open_door
+from .const import CONF_NUM_DOORS, CONF_OFFSET0, CONF_PIN, DEFAULT_PORT, DOMAIN, LOCK_CANDADO
+from .protocol import CHANNEL_OFFSET0_CURRENT, derive_device_password, open_door
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -46,6 +46,7 @@ class WayfiDoorButton(ButtonEntity):
     _attr_has_entity_name = True
 
     def __init__(self, entry: ConfigEntry, host: str, device_password: str, door_number: int) -> None:
+        self._entry = entry
         self._host = host
         self._device_password = device_password
         self._door_number = door_number
@@ -64,9 +65,21 @@ class WayfiDoorButton(ButtonEntity):
 
     async def async_press(self) -> None:
         """Open this door."""
-        success = await self.hass.async_add_executor_job(
-            open_door, self._host, DEFAULT_PORT, self._panel, self._device_password, LOCK_CANDADO
+        offset0_start = self._entry.data.get(CONF_OFFSET0, CHANNEL_OFFSET0_CURRENT)
+        success, offset0_used = await self.hass.async_add_executor_job(
+            open_door, self._host, DEFAULT_PORT, self._panel, self._device_password, LOCK_CANDADO, offset0_start
         )
+        if offset0_used is not None and offset0_used != offset0_start:
+            # The panel's accepted channel-select byte moved -- persist it
+            # on the config entry so the NEXT press (either door) starts
+            # from the right value instead of rotating from scratch again.
+            _LOGGER.warning(
+                "Panel at %s now needs offset0=%#04x (was %#04x) -- saved for next time",
+                self._host, offset0_used, offset0_start,
+            )
+            self.hass.config_entries.async_update_entry(
+                self._entry, data={**self._entry.data, CONF_OFFSET0: offset0_used}
+            )
         if not success:
             raise HomeAssistantError(
                 f"El panel en {self._host} no confirmo la apertura de la puerta {self._door_number} "
