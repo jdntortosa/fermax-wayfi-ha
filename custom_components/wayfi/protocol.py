@@ -33,7 +33,13 @@ with backtraces, real peer address and getsockname()):
     it goes straight to a 36-byte packet, type 0x0221.
   - Body offset 4 (absolute offset 24) selects the panel: 0x00 = door 1,
     0x01 = door 2. Confirmed 4/4 times across real captures.
-  - Body offset 0 (absolute offset 20) is fixed at 0x02.
+  - Body offset 0 (absolute offset 20) is fixed at 0x03 (confirmed via a
+    fresh real capture on 2026-09-26). Note: an earlier session (months
+    ago) observed 0x02 as the accepted value instead -- the panel appears
+    to have changed its accepted value at some point (possibly tied to a
+    cloud pairing/registration event), so treat this byte as the first
+    suspect if the panel ever starts rejecting this packet again with
+    status=0x06.
   - Body offset 2:4 (absolute 22:24) is NOT a local TCP port (ruled out
     with a real getsockname()): it is a literal copy of the 2-byte field
     at offset 318 of the CONTROL connection's LOGIN response (right
@@ -86,7 +92,7 @@ assert len(PLACEHOLDER_52) == 52, len(PLACEHOLDER_52)
 # meaning of each field. PANEL_CHANNEL_OFFSET and SESSION_FIELD_OFFSET are
 # absolute offsets into this 36-byte packet.
 VIDEO_START_36_TEMPLATE = bytearray.fromhex(
-    "eeeeffff2400000021020000000000000000000002000000000001000100000000000000"
+    "eeeeffff2400000021020000000000000000000003000000000001000100000000000000"
 )
 assert len(VIDEO_START_36_TEMPLATE) == 36, len(VIDEO_START_36_TEMPLATE)
 PANEL_CHANNEL_OFFSET = 24
