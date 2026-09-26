@@ -1,0 +1,74 @@
+# Fermax Way-Fi (UMEye/Quvii) for Home Assistant
+
+A Home Assistant integration for the **Fermax Way-Fi** video intercom
+(app `com.fermax.wayfi`) — an OEM device from the Chinese **UMEye/Quvii**
+platform, sold under the Fermax brand. It is **not** Fermax Blue/DUOX
+PLUS; see [`bvis/fermax-blue-hass`](https://github.com/bvis/fermax-blue-hass)
+for that different product line.
+
+This integration talks **directly to the panel over the local network**
+(TCP port 5801) — no cloud account, no vendor app, no P2P/NAT traversal
+required. It opens a `button` entity per configured door.
+
+## Why this exists
+
+The vendor app is the only official way to open the doors, and it has no
+public API. The LAN protocol used here was reverse-engineered from real
+traffic captures and dynamic instrumentation (Frida) of the Android app.
+See [`custom_components/wayfi/protocol.py`](custom_components/wayfi/protocol.py)
+for the full protocol writeup and the exact byte offsets involved.
+
+## What it does (and doesn't)
+
+- Provides one `button.open_door_N` entity per door (1 or 2), which
+  triggers the panel's relay for that door.
+- There is **no state**: this protocol has no way to read back whether a
+  door is currently open — a `button` is the honest representation, not
+  a `lock` pretending to know something it doesn't.
+- Each press takes roughly 10 seconds: the panel's outdoor unit sits on
+  an internal bus that isn't always awake, and this integration has to
+  wait for real video/audio to start flowing before the open command
+  actually reaches the physical relay (see the protocol docstring for
+  why).
+
+## Installation
+
+### Via HACS (custom repository)
+
+1. HACS → the "⋮" menu (top right) → **Custom repositories**.
+2. Add `https://github.com/jdntortosa/fermax-wayfi-ha`, category
+   **Integration**.
+3. Install **Fermax Way-Fi (UMEye/Quvii)**, then restart Home Assistant.
+4. Settings → Devices & Services → **Add Integration** → search for
+   "Fermax Way-Fi".
+
+### Manual
+
+Copy `custom_components/wayfi/` into your Home Assistant `config/custom_components/`
+directory, then restart Home Assistant and add the integration as above.
+
+## Configuration
+
+The config flow asks for:
+
+| Field | Meaning |
+|---|---|
+| Panel IP address | The panel's LAN IP address (must be reachable from Home Assistant) |
+| Device password | The panel's own device password (the same one entered as "device password" when adding it in the vendor app) |
+| Number of doors | 1 or 2 — how many `button` entities to create |
+
+The panel's device password is the same credential used by the vendor
+app itself (not your cloud account password) — see the vendor app's
+device settings, or the "device password" field shown when adding the
+panel as a "device connected to the network" in the vendor app.
+
+## Credits
+
+Protocol reverse-engineered from the `com.fermax.wayfi` Android app.
+Related prior work: [`totoantibes/golmar-quvii-ha`](https://github.com/totoantibes/golmar-quvii-ha)
+(a sibling UMEye/Quvii-family integration using the newer cloud API, not
+the LAN protocol used here).
+
+## License
+
+MIT — see [LICENSE](LICENSE).

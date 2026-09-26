@@ -1,0 +1,28 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Fermax Way-Fi video intercom",
+        "description": "Connect directly over the local network (no cloud, no vendor app). The panel's IP address must be reachable from Home Assistant.",
+        "data": {
+          "host": "Panel IP address",
+          "device_password": "Device password",
+          "num_doors": "Number of doors (1 or 2)"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Could not connect to the panel or the device password was rejected. Check the IP address and password."
+    },
+    "abort": {
+      "already_configured": "A panel with this IP address is already configured."
+    }
+  },
+  "entity": {
+    "button": {
+      "open_door": {
+        "name": "Open door {door_number}"
+      }
+    }
+  }
+}
