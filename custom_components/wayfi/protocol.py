@@ -110,12 +110,23 @@ SESSION_FIELD_OFFSET = 22
 
 # See the docstring section above ("Body offset 0 ..."): the panel's
 # accepted value at this offset has changed once already (0x02 -> 0x03)
-# and may change again. CHANNEL_OFFSET0_CURRENT is tried first (fast path
-# when nothing changed); CHANNEL_OFFSET0_FALLBACKS is the rotation used
-# when it is rejected or the bus stays silent.
+# and may change again. CHANNEL_OFFSET0_CURRENT is the hardcoded default
+# used when a config entry hasn't discovered/persisted its own value yet
+# (see CONF_OFFSET0 in const.py); CHANNEL_OFFSET0_RANGE is the full space
+# open_door() rotates through.
 CHANNEL_OFFSET0_CURRENT = 0x03
-CHANNEL_OFFSET0_FALLBACKS = tuple(v for v in range(0x00, 0x0A) if v != CHANNEL_OFFSET0_CURRENT)
+CHANNEL_OFFSET0_RANGE = tuple(range(0x00, 0x0A))
 CHANNEL_WAKE_TIMEOUT = 8.0
+
+
+def _offset0_candidates(start: int) -> list[int]:
+    """Candidate order for a rotation attempt: `start` (the panel's last
+    known-good value, or CHANNEL_OFFSET0_CURRENT if none is known yet)
+    first, then the rest of CHANNEL_OFFSET0_RANGE.
+    """
+    candidates = [start]
+    candidates.extend(v for v in CHANNEL_OFFSET0_RANGE if v != start)
+    return candidates
 
 CMD_OPEN_LOCK = 2046
 
@@ -307,76 +318,27 @@ def _try_channel_wake(channel_sock: socket.socket, panel: int, session_field: by
     return total_channel_bytes
 
 
-def _wake_panel_bus(host: str, port: int, panel: int, session_field: bytes, channel_sock: socket.socket) -> bool:
-    """Try CHANNEL_OFFSET0_CURRENT first, on `channel_sock` -- a
-    connection opened concurrently with the control connection, BEFORE
-    login, matching the exact timing confirmed to reliably wake the bus
-    (a regression was found and reverted where reconnecting *after* login
-    made door 1 stop opening physically even though the protocol still
-    reported success). Only if that is rejected or the bus stays silent
-    does it fall back to CHANNEL_OFFSET0_FALLBACKS, each retried on a
-    fresh connection -- a best-effort recovery whose timing differs from
-    the confirmed-good path, so it is not guaranteed, but strictly better
-    than giving up immediately. Returns False (fail fast) if every
-    candidate fails.
-    """
-    video_bytes = _try_channel_wake(channel_sock, panel, session_field, CHANNEL_OFFSET0_CURRENT)
-    _LOGGER.debug("Channel offset0=%#04x -> %d bytes", CHANNEL_OFFSET0_CURRENT, video_bytes)
-    if video_bytes > 0:
-        return True
+def _attempt_open(host: str, port: int, panel: int, device_password: str, lock: int, offset0: int) -> bool | None:
+    """Run ONE full, self-contained attempt: fresh control + channel
+    connections opened concurrently and BEFORE login (the exact timing
+    confirmed to reliably wake the bus -- a regression was found and
+    reverted where reconnecting the channel *after* login made door 1
+    stop opening physically even though the protocol still reported
+    success), login, channel-select with `offset0`, and -- only if the
+    bus actually wakes up -- the open command.
 
-    _LOGGER.warning(
-        "CHANNEL_OFFSET0_CURRENT (%#04x) was rejected or the bus stayed silent; "
-        "trying fallback values on new connections (best effort).",
-        CHANNEL_OFFSET0_CURRENT,
-    )
-    for offset0 in CHANNEL_OFFSET0_FALLBACKS:
-        fallback_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        fallback_sock.settimeout(5.0)
-        try:
-            fallback_sock.connect((host, port))
-            video_bytes = _try_channel_wake(fallback_sock, panel, session_field, offset0)
-        finally:
-            fallback_sock.close()
-        _LOGGER.debug("Channel offset0=%#04x (fallback) -> %d bytes", offset0, video_bytes)
-        if video_bytes > 0:
-            _LOGGER.warning(
-                "Recovered using offset0=%#04x -- update CHANNEL_OFFSET0_CURRENT in "
-                "protocol.py to this value.",
-                offset0,
-            )
-            return True
-
-    _LOGGER.error(
-        "Panel did not wake up for any candidate offset0 value (%s) -- the "
-        "accepted value likely moved outside this range; a fresh packet "
-        "capture is needed.",
-        ", ".join(f"{c:#04x}" for c in (CHANNEL_OFFSET0_CURRENT, *CHANNEL_OFFSET0_FALLBACKS)),
-    )
-    return False
-
-
-def open_door(host: str, port: int, panel: int, device_password: str, lock: int = 0) -> bool:
-    """Run the full protocol (login, panel selection, wait for real video,
-    open command) and return True if the panel confirmed the open
-    (result byte == 0x00).
-
-    This is a *blocking* call (plain sockets, several seconds of wait built
-    in) -- callers running inside Home Assistant's event loop must run it
-    via `hass.async_add_executor_job`.
+    Returns True/False for a real open attempt (bus woke up), or None if
+    this `offset0` was rejected or the bus stayed silent -- the caller
+    should then retry with a different candidate, each getting this exact
+    same known-good timing (never a bare reconnect of just the channel
+    socket after an existing login, which is not verified to work).
     """
     control_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     control_sock.settimeout(5.0)
-    _LOGGER.debug("Connecting (control) to %s:%s", host, port)
     control_sock.connect((host, port))
 
-    # The channel-select connection is opened here, concurrently with the
-    # control connection and BEFORE login -- this exact timing (not just
-    # sending the right bytes) is required for the bus to wake up
-    # reliably; opening it later regressed door 1 in practice.
     channel_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     channel_sock.settimeout(5.0)
-    _LOGGER.debug("Connecting (channel select) to %s:%s", host, port)
     channel_sock.connect((host, port))
 
     try:
@@ -390,12 +352,11 @@ def open_door(host: str, port: int, panel: int, device_password: str, lock: int 
         _recv_exact(control_sock, 52)
 
         session_field = _extract_session_field(login_resp)
-        _LOGGER.debug("Selecting panel %d, session_field=%s", panel, session_field.hex())
-        if not _wake_panel_bus(host, port, panel, session_field, channel_sock):
-            # Fail fast: never send the open command over a bus that
-            # never woke up -- that would report a false "success"
-            # (result byte 0x00) without the physical relay firing.
-            return False
+        _LOGGER.debug("Selecting panel %d, session_field=%s, offset0=%#04x", panel, session_field.hex(), offset0)
+        video_bytes = _try_channel_wake(channel_sock, panel, session_field, offset0)
+        _LOGGER.debug("Channel offset0=%#04x -> %d bytes", offset0, video_bytes)
+        if video_bytes == 0:
+            return None
 
         for query in PRE_OPEN_QUERIES:
             control_sock.sendall(query)
@@ -415,3 +376,52 @@ def open_door(host: str, port: int, panel: int, device_password: str, lock: int 
     finally:
         control_sock.close()
         channel_sock.close()
+
+
+def open_door(
+    host: str, port: int, panel: int, device_password: str, lock: int = 0,
+    offset0_start: int = CHANNEL_OFFSET0_CURRENT,
+) -> tuple[bool, int | None]:
+    """Run the full protocol (login, panel selection, wait for real video,
+    open command) and return (success, offset0_used).
+
+    `offset0_start` should be the last value confirmed to work for this
+    specific panel (persisted by the caller -- see CONF_OFFSET0 in
+    const.py), falling back to CHANNEL_OFFSET0_CURRENT if none is known
+    yet. It is tried first; if the panel rejects it or the bus stays
+    silent, this rotates through the rest of CHANNEL_OFFSET0_RANGE, each
+    as a full independent attempt (own connections + own login) so every
+    candidate gets the identical, confirmed-good connection timing --
+    fail fast (success=False) only once every candidate has been tried
+    without waking the bus. `offset0_used` is the value that worked (the
+    caller should persist it if it differs from what it passed in), or
+    None if nothing woke the bus.
+
+    This is a *blocking* call (plain sockets, several seconds of wait built
+    in) -- callers running inside Home Assistant's event loop must run it
+    via `hass.async_add_executor_job`.
+    """
+    candidates = _offset0_candidates(offset0_start)
+
+    result = _attempt_open(host, port, panel, device_password, lock, candidates[0])
+    if result is not None:
+        return result, candidates[0]
+
+    _LOGGER.warning(
+        "offset0=%#04x was rejected or the bus stayed silent; trying other "
+        "values (each a full independent attempt).",
+        candidates[0],
+    )
+    for offset0 in candidates[1:]:
+        result = _attempt_open(host, port, panel, device_password, lock, offset0)
+        if result is not None:
+            _LOGGER.warning("Recovered using offset0=%#04x.", offset0)
+            return result, offset0
+
+    _LOGGER.error(
+        "Panel did not wake up for any candidate offset0 value (%s) -- the "
+        "accepted value likely moved outside this range; a fresh packet "
+        "capture is needed.",
+        ", ".join(f"{c:#04x}" for c in candidates),
+    )
+    return False, None

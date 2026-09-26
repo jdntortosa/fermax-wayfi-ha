@@ -80,11 +80,11 @@ with pairing a new phone on the same panel that day), but this could
 just as easily be firmware-side and unrelated; no vendor documentation
 or disassembly has confirmed either way. Since v0.8 the integration
 handles this defensively regardless of the real cause: it tries the last
-known-good value first and, if rejected, rotates through a small range
-of candidates until the panel's outdoor unit actually wakes up (real
-video/audio flowing, not just a protocol ACK). Check the integration's
-logs for a `WARNING` naming the value that worked, so `protocol.py`'s
-`CHANNEL_OFFSET0_CURRENT` can be updated for next time.
+known-good value first (persisted per config entry, so no code changes
+or manual steps are needed — see a `WARNING` in the logs if it ever has
+to rediscover it) and, if rejected, rotates through a small range of
+candidates until the panel's outdoor unit actually wakes up (real
+video/audio flowing, not just a protocol ACK).
 
 If the button still fails after that (every candidate rejected), the
 panel likely moved the accepted value outside the built-in range — please
