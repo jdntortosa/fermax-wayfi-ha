@@ -14,6 +14,7 @@ from homeassistant.components.button import ButtonEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
@@ -67,8 +68,7 @@ class WayfiDoorButton(ButtonEntity):
             open_door, self._host, DEFAULT_PORT, self._panel, self._device_password, LOCK_CANDADO
         )
         if not success:
-            _LOGGER.warning(
-                "Panel at %s did not confirm the open command for door %d",
-                self._host,
-                self._door_number,
+            raise HomeAssistantError(
+                f"El panel en {self._host} no confirmo la apertura de la puerta {self._door_number} "
+                "(el bus no desperto o el comando de apertura fallo -- ver logs de la integracion)"
             )

@@ -33,13 +33,22 @@ with backtraces, real peer address and getsockname()):
     it goes straight to a 36-byte packet, type 0x0221.
   - Body offset 4 (absolute offset 24) selects the panel: 0x00 = door 1,
     0x01 = door 2. Confirmed 4/4 times across real captures.
-  - Body offset 0 (absolute offset 20) is fixed at 0x03 (confirmed via a
-    fresh real capture on 2026-09-26). Note: an earlier session (months
-    ago) observed 0x02 as the accepted value instead -- the panel appears
-    to have changed its accepted value at some point (possibly tied to a
-    cloud pairing/registration event), so treat this byte as the first
-    suspect if the panel ever starts rejecting this packet again with
-    status=0x06.
+  - Body offset 0 (absolute offset 20) is currently 0x03 (confirmed via a
+    fresh real capture on 2026-09-26). An earlier session (months ago)
+    observed 0x02 as the accepted value instead -- the panel appears to
+    change its accepted value over time (possibly tied to a cloud
+    pairing/registration event), and there is no way to predict the next
+    one. Because of this, open_door() does not hardcode a single value:
+    it tries CHANNEL_OFFSET0_CURRENT first, and on rejection or on a
+    silent bus (accepted but no real video/audio follows) rotates through
+    CHANNEL_OFFSET0_FALLBACKS (the rest of 0x00-0x09) until one both gets
+    accepted AND the bus actually wakes up. If a fallback value is what
+    worked, a warning is logged naming it -- update
+    CHANNEL_OFFSET0_CURRENT to that value so future calls succeed on the
+    first try again. If the whole range is exhausted, open_door() fails
+    fast (returns False without attempting the open command) instead of
+    reporting a false "success" -- that scenario means the real value
+    moved outside 0x00-0x09 and needs a fresh packet capture to find.
   - Body offset 2:4 (absolute 22:24) is NOT a local TCP port (ruled out
     with a real getsockname()): it is a literal copy of the 2-byte field
     at offset 318 of the CONTROL connection's LOGIN response (right
@@ -89,14 +98,24 @@ PLACEHOLDER_52 = bytes.fromhex(
 assert len(PLACEHOLDER_52) == 52, len(PLACEHOLDER_52)
 
 # Channel-select packet (type 0x0221). See module docstring for the
-# meaning of each field. PANEL_CHANNEL_OFFSET and SESSION_FIELD_OFFSET are
-# absolute offsets into this 36-byte packet.
+# meaning of each field. CHANNEL_TYPE_OFFSET, PANEL_CHANNEL_OFFSET and
+# SESSION_FIELD_OFFSET are absolute offsets into this 36-byte packet.
 VIDEO_START_36_TEMPLATE = bytearray.fromhex(
     "eeeeffff2400000021020000000000000000000003000000000001000100000000000000"
 )
 assert len(VIDEO_START_36_TEMPLATE) == 36, len(VIDEO_START_36_TEMPLATE)
+CHANNEL_TYPE_OFFSET = 20
 PANEL_CHANNEL_OFFSET = 24
 SESSION_FIELD_OFFSET = 22
+
+# See the docstring section above ("Body offset 0 ..."): the panel's
+# accepted value at this offset has changed once already (0x02 -> 0x03)
+# and may change again. CHANNEL_OFFSET0_CURRENT is tried first (fast path
+# when nothing changed); CHANNEL_OFFSET0_FALLBACKS is the rotation used
+# when it is rejected or the bus stays silent.
+CHANNEL_OFFSET0_CURRENT = 0x03
+CHANNEL_OFFSET0_FALLBACKS = tuple(v for v in range(0x00, 0x0A) if v != CHANNEL_OFFSET0_CURRENT)
+CHANNEL_WAKE_TIMEOUT = 8.0
 
 CMD_OPEN_LOCK = 2046
 
@@ -150,12 +169,13 @@ def derive_device_password(pin: str) -> str:
     return "".join(chars)
 
 
-def build_video_start(panel: int, session_field: bytes) -> bytes:
+def build_video_start(panel: int, session_field: bytes, offset0: int = CHANNEL_OFFSET0_CURRENT) -> bytes:
     if panel not in (0, 1):
         raise ValueError("panel must be 0 (door 1) or 1 (door 2)")
     if len(session_field) != 2:
         raise ValueError("session_field must be 2 bytes")
     pkt = bytearray(VIDEO_START_36_TEMPLATE)
+    pkt[CHANNEL_TYPE_OFFSET] = offset0
     pkt[PANEL_CHANNEL_OFFSET] = panel
     pkt[SESSION_FIELD_OFFSET:SESSION_FIELD_OFFSET + 2] = session_field
     return bytes(pkt)
@@ -260,6 +280,82 @@ def test_connection(host: str, port: int, device_password: str) -> None:
         sock.close()
 
 
+def _try_channel_wake(channel_sock: socket.socket, panel: int, session_field: bytes, offset0: int) -> int:
+    """Send a channel-select packet on an already-open `channel_sock` and
+    wait for real video/audio to confirm the bus woke up. Returns the
+    number of bytes received (0 = rejected or bus stayed silent).
+    """
+    channel_sock.sendall(build_video_start(panel, session_field, offset0))
+    try:
+        channel_resp = channel_sock.recv(4096)
+    except socket.timeout:
+        return 0
+    if len(channel_resp) < 12 or channel_resp[11] != 0:
+        return 0
+
+    channel_sock.settimeout(CHANNEL_WAKE_TIMEOUT)
+    total_channel_bytes = 0
+    deadline = time.time() + CHANNEL_WAKE_TIMEOUT
+    while time.time() < deadline:
+        try:
+            chunk = channel_sock.recv(4096)
+            if not chunk:
+                break
+            total_channel_bytes += len(chunk)
+        except socket.timeout:
+            break
+    return total_channel_bytes
+
+
+def _wake_panel_bus(host: str, port: int, panel: int, session_field: bytes, channel_sock: socket.socket) -> bool:
+    """Try CHANNEL_OFFSET0_CURRENT first, on `channel_sock` -- a
+    connection opened concurrently with the control connection, BEFORE
+    login, matching the exact timing confirmed to reliably wake the bus
+    (a regression was found and reverted where reconnecting *after* login
+    made door 1 stop opening physically even though the protocol still
+    reported success). Only if that is rejected or the bus stays silent
+    does it fall back to CHANNEL_OFFSET0_FALLBACKS, each retried on a
+    fresh connection -- a best-effort recovery whose timing differs from
+    the confirmed-good path, so it is not guaranteed, but strictly better
+    than giving up immediately. Returns False (fail fast) if every
+    candidate fails.
+    """
+    video_bytes = _try_channel_wake(channel_sock, panel, session_field, CHANNEL_OFFSET0_CURRENT)
+    _LOGGER.debug("Channel offset0=%#04x -> %d bytes", CHANNEL_OFFSET0_CURRENT, video_bytes)
+    if video_bytes > 0:
+        return True
+
+    _LOGGER.warning(
+        "CHANNEL_OFFSET0_CURRENT (%#04x) was rejected or the bus stayed silent; "
+        "trying fallback values on new connections (best effort).",
+        CHANNEL_OFFSET0_CURRENT,
+    )
+    for offset0 in CHANNEL_OFFSET0_FALLBACKS:
+        fallback_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        fallback_sock.settimeout(5.0)
+        try:
+            fallback_sock.connect((host, port))
+            video_bytes = _try_channel_wake(fallback_sock, panel, session_field, offset0)
+        finally:
+            fallback_sock.close()
+        _LOGGER.debug("Channel offset0=%#04x (fallback) -> %d bytes", offset0, video_bytes)
+        if video_bytes > 0:
+            _LOGGER.warning(
+                "Recovered using offset0=%#04x -- update CHANNEL_OFFSET0_CURRENT in "
+                "protocol.py to this value.",
+                offset0,
+            )
+            return True
+
+    _LOGGER.error(
+        "Panel did not wake up for any candidate offset0 value (%s) -- the "
+        "accepted value likely moved outside this range; a fresh packet "
+        "capture is needed.",
+        ", ".join(f"{c:#04x}" for c in (CHANNEL_OFFSET0_CURRENT, *CHANNEL_OFFSET0_FALLBACKS)),
+    )
+    return False
+
+
 def open_door(host: str, port: int, panel: int, device_password: str, lock: int = 0) -> bool:
     """Run the full protocol (login, panel selection, wait for real video,
     open command) and return True if the panel confirmed the open
@@ -274,6 +370,10 @@ def open_door(host: str, port: int, panel: int, device_password: str, lock: int 
     _LOGGER.debug("Connecting (control) to %s:%s", host, port)
     control_sock.connect((host, port))
 
+    # The channel-select connection is opened here, concurrently with the
+    # control connection and BEFORE login -- this exact timing (not just
+    # sending the right bytes) is required for the bus to wake up
+    # reliably; opening it later regressed door 1 in practice.
     channel_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     channel_sock.settimeout(5.0)
     _LOGGER.debug("Connecting (channel select) to %s:%s", host, port)
@@ -291,30 +391,11 @@ def open_door(host: str, port: int, panel: int, device_password: str, lock: int 
 
         session_field = _extract_session_field(login_resp)
         _LOGGER.debug("Selecting panel %d, session_field=%s", panel, session_field.hex())
-        channel_sock.sendall(build_video_start(panel, session_field))
-        try:
-            channel_resp = channel_sock.recv(4096)
-            if len(channel_resp) >= 12 and channel_resp[11] != 0:
-                _LOGGER.warning("Panel rejected channel selection: status=%#04x", channel_resp[11])
-        except socket.timeout:
-            _LOGGER.warning("No response to channel selection (timeout), continuing anyway")
-
-        # The outdoor unit sits on a bus that is not always awake. A
-        # status=0x00 accept above is not enough on its own -- wait to
-        # see real video/audio start flowing on this same connection,
-        # which is the actual signal that the bus woke that panel up.
-        channel_sock.settimeout(8.0)
-        total_channel_bytes = 0
-        deadline = time.time() + 8.0
-        while time.time() < deadline:
-            try:
-                chunk = channel_sock.recv(4096)
-                if not chunk:
-                    break
-                total_channel_bytes += len(chunk)
-            except socket.timeout:
-                break
-        _LOGGER.debug("Received %d bytes on the channel connection", total_channel_bytes)
+        if not _wake_panel_bus(host, port, panel, session_field, channel_sock):
+            # Fail fast: never send the open command over a bus that
+            # never woke up -- that would report a false "success"
+            # (result byte 0x00) without the physical relay firing.
+            return False
 
         for query in PRE_OPEN_QUERIES:
             control_sock.sendall(query)
