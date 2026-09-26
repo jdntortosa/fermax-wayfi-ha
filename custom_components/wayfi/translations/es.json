@@ -1,0 +1,28 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Videoportero Fermax Way-Fi",
+        "description": "Conexion directa por red local (sin nube ni app del fabricante). La IP del panel debe ser accesible desde Home Assistant.",
+        "data": {
+          "host": "Direccion IP del panel",
+          "device_password": "Contrasena del dispositivo",
+          "num_doors": "Numero de puertas (1 o 2)"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "No se ha podido conectar con el panel, o la contrasena fue rechazada. Comprueba la IP y la contrasena."
+    },
+    "abort": {
+      "already_configured": "Ya hay un panel configurado con esta direccion IP."
+    }
+  },
+  "entity": {
+    "button": {
+      "open_door": {
+        "name": "Abrir puerta {door_number}"
+      }
+    }
+  }
+}

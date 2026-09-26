@@ -1,0 +1,12 @@
+{
+  "domain": "wayfi",
+  "name": "Fermax Way-Fi (UMEye/Quvii)",
+  "codeowners": ["@jdntortosa"],
+  "config_flow": true,
+  "documentation": "https://github.com/jdntortosa/fermax-wayfi-ha",
+  "issue_tracker": "https://github.com/jdntortosa/fermax-wayfi-ha/issues",
+  "iot_class": "local_push",
+  "integration_type": "hub",
+  "requirements": [],
+  "version": "0.1.0"
+}
