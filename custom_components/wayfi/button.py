@@ -17,8 +17,8 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import CONF_DEVICE_PASSWORD, CONF_NUM_DOORS, DEFAULT_PORT, DOMAIN, LOCK_CANDADO
-from .protocol import open_door
+from .const import CONF_NUM_DOORS, CONF_PIN, DEFAULT_PORT, DOMAIN, LOCK_CANDADO
+from .protocol import derive_device_password, open_door
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -30,7 +30,7 @@ async def async_setup_entry(
 ) -> None:
     """Set up one button per configured door."""
     host = entry.data[CONF_HOST]
-    device_password = entry.data[CONF_DEVICE_PASSWORD]
+    device_password = derive_device_password(entry.data[CONF_PIN])
     num_doors = entry.data[CONF_NUM_DOORS]
 
     async_add_entities(

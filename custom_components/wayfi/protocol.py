@@ -113,6 +113,37 @@ class WayfiConnectionError(Exception):
     """Raised when the panel cannot be reached or rejects the login."""
 
 
+def derive_device_password(pin: str) -> str:
+    """Derive the protocol-level "device password" from the PIN the user
+    enters in the vendor app (e.g. "2108").
+
+    Reverse-engineered by statically disassembling the app's own
+    NPC_TOOLS_MD5_MD5Encrypt(char* out, char* in) in
+    libNewAllStreamParser.so, and confirmed against a real captured
+    value (pin "2108" -> "n4DVjrgh"):
+
+      1) Compute a plain MD5 digest of `pin` (16 bytes).
+      2) For each of the 8 consecutive byte pairs in that digest,
+         sum the pair and reduce it modulo 62.
+      3) Map 0-9 to '0'-'9', 10-35 to 'A'-'Z', 36-61 to 'a'-'z'.
+
+    The vendor app then uses this 8-character result (not the PIN
+    itself) both as the LOGIN password and inside the open-lock command
+    body.
+    """
+    digest = hashlib.md5(pin.encode()).digest()
+    chars = []
+    for i in range(8):
+        value = (digest[2 * i] + digest[2 * i + 1]) % 62
+        if value <= 9:
+            chars.append(chr(0x30 + value))
+        elif value <= 35:
+            chars.append(chr(0x37 + value))
+        else:
+            chars.append(chr(0x3D + value))
+    return "".join(chars)
+
+
 def build_video_start(panel: int, session_field: bytes) -> bytes:
     if panel not in (0, 1):
         raise ValueError("panel must be 0 (door 1) or 1 (door 2)")

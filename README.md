@@ -54,13 +54,16 @@ The config flow asks for:
 | Field | Meaning |
 |---|---|
 | Panel IP address | The panel's LAN IP address (must be reachable from Home Assistant) |
-| Device password | The panel's own device password (the same one entered as "device password" when adding it in the vendor app) |
+| App password | The same PIN/password you already use in the vendor app to unlock the panel — enter it as-is |
 | Number of doors | 1 or 2 — how many `button` entities to create |
 
-The panel's device password is the same credential used by the vendor
-app itself (not your cloud account password) — see the vendor app's
-device settings, or the "device password" field shown when adding the
-panel as a "device connected to the network" in the vendor app.
+The vendor app never sends this PIN over the wire as-is: it derives an
+8-character value from it first (see
+[`protocol.py`](custom_components/wayfi/protocol.py), function
+`derive_device_password`, reverse-engineered from the app's own native
+code) and uses that derived value in the LAN protocol. This integration
+does the same derivation internally, so you only ever need the PIN you
+already know.
 
 ## Credits
 
