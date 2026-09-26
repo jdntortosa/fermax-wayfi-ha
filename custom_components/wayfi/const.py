@@ -3,7 +3,7 @@
 DOMAIN = "wayfi"
 
 CONF_HOST = "host"
-CONF_DEVICE_PASSWORD = "device_password"
+CONF_PIN = "pin"
 CONF_NUM_DOORS = "num_doors"
 
 DEFAULT_PORT = 5801

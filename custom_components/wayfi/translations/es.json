@@ -6,7 +6,7 @@
         "description": "Conexion directa por red local (sin nube ni app del fabricante). La IP del panel debe ser accesible desde Home Assistant.",
         "data": {
           "host": "Direccion IP del panel",
-          "device_password": "Contrasena del dispositivo",
+          "pin": "Contrasena de la app (el PIN/contrasena que usas en la app del fabricante)",
           "num_doors": "Numero de puertas (1 o 2)"
         }
       }

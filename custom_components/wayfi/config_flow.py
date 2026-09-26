@@ -17,15 +17,15 @@ from homeassistant.helpers.selector import (
     TextSelectorType,
 )
 
-from .const import CONF_DEVICE_PASSWORD, CONF_NUM_DOORS, DEFAULT_NUM_DOORS, DEFAULT_PORT, DOMAIN
-from .protocol import WayfiConnectionError, test_connection
+from .const import CONF_NUM_DOORS, CONF_PIN, DEFAULT_NUM_DOORS, DEFAULT_PORT, DOMAIN
+from .protocol import WayfiConnectionError, derive_device_password, test_connection
 
 _LOGGER = logging.getLogger(__name__)
 
 STEP_USER_DATA_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_HOST): TextSelector(TextSelectorConfig(type=TextSelectorType.TEXT)),
-        vol.Required(CONF_DEVICE_PASSWORD): TextSelector(
+        vol.Required(CONF_PIN): TextSelector(
             TextSelectorConfig(type=TextSelectorType.PASSWORD)
         ),
         vol.Required(CONF_NUM_DOORS, default=DEFAULT_NUM_DOORS): NumberSelector(
@@ -48,12 +48,13 @@ class WayfiConfigFlow(ConfigFlow, domain=DOMAIN):
 
         if user_input is not None:
             host = user_input[CONF_HOST]
-            device_password = user_input[CONF_DEVICE_PASSWORD]
+            pin = user_input[CONF_PIN]
             num_doors = int(user_input[CONF_NUM_DOORS])
 
             await self.async_set_unique_id(host)
             self._abort_if_unique_id_configured()
 
+            device_password = derive_device_password(pin)
             try:
                 await self.hass.async_add_executor_job(
                     test_connection, host, DEFAULT_PORT, device_password
@@ -66,7 +67,7 @@ class WayfiConfigFlow(ConfigFlow, domain=DOMAIN):
                     title=f"Fermax Way-Fi ({host})",
                     data={
                         CONF_HOST: host,
-                        CONF_DEVICE_PASSWORD: device_password,
+                        CONF_PIN: pin,
                         CONF_NUM_DOORS: num_doors,
                     },
                 )
