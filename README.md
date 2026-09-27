@@ -78,8 +78,9 @@ the "open live video" request — and its first parameter is a
 **panel-assigned session id that the panel sends in every LOGIN response**
 (4 bytes at offset 316). The integration copies it verbatim, exactly like
 the official app. Its low byte once changed on the panel side (`0x02` →
-`0x03`, apparently when a new phone was paired); since v1.0.0 that is
-handled automatically because the value is no longer hardcoded.
+`0x03`, cause unknown — it does not change when a phone is unpaired and
+re-paired); since v1.0.0 that is handled automatically because the value
+is no longer hardcoded.
 
 As a safety net (in case a future firmware changes the LOGIN layout), if
 the panel still rejects the stream-open or its outdoor unit doesn't wake

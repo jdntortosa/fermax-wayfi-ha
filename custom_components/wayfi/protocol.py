@@ -53,8 +53,9 @@ as four fields:
         the panel and stable across sessions (0x03 today; a capture from
         months ago had 0x02, and the panel rejects the old value). It is
         NOT a media bitmask. What the 0x0003 represents inside the panel
-        is unconfirmed (leading hypothesis: an index/count of paired
-        clients, since it changed when a new phone was paired).
+        is unknown: it does not change when a phone is unpaired and
+        re-paired (tested 2026-09-27); possibly an attribute of the
+        "admin" account.
       * High 2 bytes, body[2:4] = session field, different on every login.
       See _extract_realplay_param1() / build_video_start().
   - body[4:6]  = param2 (uint16) = channel/panel: 0x0000 = door 1,
