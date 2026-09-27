@@ -39,23 +39,24 @@ i.e. the "open live video (realplay)" request. Its native signature is
 (conn, uint32, uint16, uint16, uint32), which maps onto the 16-byte body
 as four fields:
 
-  - body[0:4]  = param1 (uint32) = (session_field << 16) | 0x0003
-      * The low byte, body[0] (absolute offset 20), is CHANNEL_OFFSET0.
-        It is the low byte of the realplay-open stream parameter -- NOT a
-        registered-client index or a device id, despite once looking like
-        one. Its value is currently 0x03; a capture from months ago had
-        0x02, and the panel now rejects 0x02 with status=0x06. The exact
-        meaning of the 2-vs-3 enum was not fully resolved from the caller;
-        the most plausible reading is a media bitmask (bit0=video,
-        bit1=audio -> 0x03 = video+audio, consistent with H264 *and* G711
-        both arriving on this connection), but that is a hypothesis, not
-        confirmed. Whether the change was triggered by an app update
-        (recompiled constant) or a panel firmware change is unknown.
-      * The high 2 bytes, body[2:4] (absolute 22:24), are SESSION_FIELD:
-        a literal copy of the 2-byte field at offset 318 of the CONTROL
-        connection's LOGIN response (right before the ASCII "DVR"). This
-        is what binds this unauthenticated connection to the logged-in
-        session. Without it the panel rejects with status=0x06.
+  - body[0:4]  = param1 (uint32) = a verbatim copy of the u32 LE at
+    absolute offset 316 of the CONTROL connection's LOGIN response (right
+    before the ASCII "DVR"). This is exactly what the native SDK does
+    (confirmed against the official, symbol-bearing UMEye SDK,
+    kdzntop/umeye-aar): DoProData_P1_LOGIN stores that u32 and
+    DoNetData_NET_TCP_CONNECT copies it verbatim into this packet. It is a
+    panel-assigned session/user id (the SDK also sends it as the first
+    u32 of almost every UMSP command), and it is what binds this
+    unauthenticated connection to the logged-in session; if it does not
+    match, the panel rejects with status=0x06.
+      * Low byte, body[0] (absolute offset 20) = CHANNEL_OFFSET0: set by
+        the panel and stable across sessions (0x03 today; a capture from
+        months ago had 0x02, and the panel rejects the old value). It is
+        NOT a media bitmask. What the 0x0003 represents inside the panel
+        is unconfirmed (leading hypothesis: an index/count of paired
+        clients, since it changed when a new phone was paired).
+      * High 2 bytes, body[2:4] = session field, different on every login.
+      See _extract_realplay_param1() / build_video_start().
   - body[4:6]  = param2 (uint16) = channel/panel: 0x0000 = door 1,
     0x0001 = door 2. body[4] is PANEL_CHANNEL_OFFSET. Confirmed 4/4.
   - body[6:8]  = param3 (uint16) = fixed 0x0001.
@@ -63,15 +64,15 @@ as four fields:
   - body[12:16] are 0 in the request; the panel fills them in its reply
     (04 00 <2 bytes>, apparently a media-session id/port it assigns).
 
-Because the CHANNEL_OFFSET0 value has already shifted once (0x02 -> 0x03)
-and may shift again, open_door() does not trust a single hardcoded value:
-it tries the last known-good one first (persisted per config entry, see
-CONF_OFFSET0), and on rejection or a silent bus (accepted but no real
-video/audio follows) rotates through the rest of CHANNEL_OFFSET0_RANGE
-until one both gets accepted AND wakes the bus. If the whole range is
-exhausted it fails fast (returns success=False WITHOUT sending the open
-command) rather than reporting a false "success" -- that means the real
-value moved outside 0x00-0x09 and needs a fresh packet capture.
+open_door() first sends param1 exactly as the LOGIN returned it. As a
+safety net (in case a future firmware changes the LOGIN layout), if that
+value is rejected or the bus stays silent (accepted but no real
+video/audio follows) it rotates CHANNEL_OFFSET0 through
+CHANNEL_OFFSET0_RANGE, starting at the last known-good value (persisted
+per config entry, see CONF_OFFSET0), until one both gets accepted AND
+wakes the bus. If everything is exhausted it fails fast (returns
+success=False WITHOUT sending the open command) rather than reporting a
+false "success" -- that needs a fresh packet capture.
 
 A status=0x00 accept is not enough on its own: the outdoor unit sits on
 an internal bus that is not always "awake". Real video/audio starts
@@ -112,22 +113,22 @@ assert len(PLACEHOLDER_52) == 52, len(PLACEHOLDER_52)
 
 # UMSP EX_REALPLAY_OPEN packet (type 0x0221). See the module docstring for
 # the full field breakdown recovered from the native library.
-# CHANNEL_TYPE_OFFSET, PANEL_CHANNEL_OFFSET and SESSION_FIELD_OFFSET are
+# PARAM1_OFFSET, CHANNEL_TYPE_OFFSET and PANEL_CHANNEL_OFFSET are
 # absolute offsets into this 36-byte packet.
 VIDEO_START_36_TEMPLATE = bytearray.fromhex(
     "eeeeffff2400000021020000000000000000000003000000000001000100000000000000"
 )
 assert len(VIDEO_START_36_TEMPLATE) == 36, len(VIDEO_START_36_TEMPLATE)
+PARAM1_OFFSET = 20
 CHANNEL_TYPE_OFFSET = 20
 PANEL_CHANNEL_OFFSET = 24
-SESSION_FIELD_OFFSET = 22
 
-# CHANNEL_OFFSET0 = low byte of the realplay-open stream parameter (see
-# docstring). The panel's accepted value has changed once already
-# (0x02 -> 0x03) and may change again. CHANNEL_OFFSET0_CURRENT is the
-# hardcoded default used when a config entry hasn't discovered/persisted
-# its own value yet (see CONF_OFFSET0 in const.py); CHANNEL_OFFSET0_RANGE
-# is the full space open_door() rotates through.
+# CHANNEL_OFFSET0 = low byte of param1, normally copied from the LOGIN
+# (see docstring). These constants are only used by the rotation safety
+# net: CHANNEL_OFFSET0_CURRENT is the starting point when a config entry
+# hasn't persisted its own value yet (see CONF_OFFSET0 in const.py);
+# CHANNEL_OFFSET0_RANGE is the space open_door() rotates through if the
+# LOGIN value is rejected or the bus stays silent.
 CHANNEL_OFFSET0_CURRENT = 0x03
 CHANNEL_OFFSET0_RANGE = tuple(range(0x00, 0x0A))
 CHANNEL_WAKE_TIMEOUT = 8.0
@@ -156,7 +157,7 @@ PRE_OPEN_QUERIES = [
 ]
 
 DEVICE_GROUP_ID = b"G0021"
-LOGIN_RESP_SESSION_FIELD_OFFSET = 318
+LOGIN_RESP_PARAM1_OFFSET = 316
 
 
 class WayfiConnectionError(Exception):
@@ -194,15 +195,20 @@ def derive_device_password(pin: str) -> str:
     return "".join(chars)
 
 
-def build_video_start(panel: int, session_field: bytes, offset0: int = CHANNEL_OFFSET0_CURRENT) -> bytes:
+def build_video_start(panel: int, param1: bytes, offset0: int | None = None) -> bytes:
+    """`param1` is the 4 bytes copied from the LOGIN response (see
+    _extract_realplay_param1()). `offset0`, if given, overrides only its
+    low byte -- this is open_door()'s rotation safety net.
+    """
     if panel not in (0, 1):
         raise ValueError("panel must be 0 (door 1) or 1 (door 2)")
-    if len(session_field) != 2:
-        raise ValueError("session_field must be 2 bytes")
+    if len(param1) != 4:
+        raise ValueError("param1 must be 4 bytes")
     pkt = bytearray(VIDEO_START_36_TEMPLATE)
-    pkt[CHANNEL_TYPE_OFFSET] = offset0
+    pkt[PARAM1_OFFSET:PARAM1_OFFSET + 4] = param1
+    if offset0 is not None:
+        pkt[CHANNEL_TYPE_OFFSET] = offset0
     pkt[PANEL_CHANNEL_OFFSET] = panel
-    pkt[SESSION_FIELD_OFFSET:SESSION_FIELD_OFFSET + 2] = session_field
     return bytes(pkt)
 
 
@@ -269,8 +275,15 @@ def _perform_login(sock: socket.socket, device_password: str) -> bytes:
     return login_resp
 
 
-def _extract_session_field(login_resp: bytes) -> bytes:
-    return login_resp[LOGIN_RESP_SESSION_FIELD_OFFSET:LOGIN_RESP_SESSION_FIELD_OFFSET + 2]
+def _extract_realplay_param1(login_resp: bytes) -> bytes:
+    """The 4 bytes (u32 LE, absolute offset 316 of the LOGIN response,
+    right before the "DVR" string) sent verbatim as param1 of the 0x0221
+    packet -- exactly what the native SDK does (DoProData_P1_LOGIN stores
+    this u32, NET_TCP_CONNECT copies it into the packet). Low byte =
+    CHANNEL_OFFSET0 (stable across sessions, 0x03 today); high 2 bytes =
+    session field (different on every login).
+    """
+    return login_resp[LOGIN_RESP_PARAM1_OFFSET:LOGIN_RESP_PARAM1_OFFSET + 4]
 
 
 def _build_open_packet(lock_num: int, device_password: str) -> bytes:
@@ -305,12 +318,12 @@ def test_connection(host: str, port: int, device_password: str) -> None:
         sock.close()
 
 
-def _try_channel_wake(channel_sock: socket.socket, panel: int, session_field: bytes, offset0: int) -> int:
+def _try_channel_wake(channel_sock: socket.socket, panel: int, param1: bytes, offset0: int | None) -> int:
     """Send a channel-select packet on an already-open `channel_sock` and
     wait for real video/audio to confirm the bus woke up. Returns the
     number of bytes received (0 = rejected or bus stayed silent).
     """
-    channel_sock.sendall(build_video_start(panel, session_field, offset0))
+    channel_sock.sendall(build_video_start(panel, param1, offset0))
     try:
         channel_resp = channel_sock.recv(4096)
     except socket.timeout:
@@ -332,7 +345,9 @@ def _try_channel_wake(channel_sock: socket.socket, panel: int, session_field: by
     return total_channel_bytes
 
 
-def _attempt_open(host: str, port: int, panel: int, device_password: str, lock: int, offset0: int) -> bool | None:
+def _attempt_open(
+    host: str, port: int, panel: int, device_password: str, lock: int, offset0: int | None
+) -> tuple[bool | None, int | None]:
     """Run ONE full, self-contained attempt: fresh control + channel
     connections opened concurrently and BEFORE login (the exact timing
     confirmed to reliably wake the bus -- a regression was found and
@@ -341,11 +356,16 @@ def _attempt_open(host: str, port: int, panel: int, device_password: str, lock: 
     success), login, channel-select with `offset0`, and -- only if the
     bus actually wakes up -- the open command.
 
-    Returns True/False for a real open attempt (bus woke up), or None if
-    this `offset0` was rejected or the bus stayed silent -- the caller
-    should then retry with a different candidate, each getting this exact
-    same known-good timing (never a bare reconnect of just the channel
-    socket after an existing login, which is not verified to work).
+    `offset0=None` sends param1 exactly as the LOGIN returned it (normal
+    path); an int overrides its low byte (rotation safety net).
+
+    Returns (result, offset0_sent). `result` is True/False for a real
+    open attempt (bus woke up), or None if this `offset0` was rejected or
+    the bus stayed silent -- the caller should then retry with a different
+    candidate, each getting this exact same known-good timing (never a
+    bare reconnect of just the channel socket after an existing login,
+    which is not verified to work). `offset0_sent` is the low byte the
+    packet actually carried (None if it was never sent).
     """
     control_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     control_sock.settimeout(5.0)
@@ -360,17 +380,19 @@ def _attempt_open(host: str, port: int, panel: int, device_password: str, lock: 
             login_resp = _perform_login(control_sock, device_password)
         except WayfiConnectionError as exc:
             _LOGGER.error("Control connection login failed: %s", exc)
-            return False
+            return False, None
 
         control_sock.sendall(PLACEHOLDER_52)
         _recv_exact(control_sock, 52)
 
-        session_field = _extract_session_field(login_resp)
-        _LOGGER.debug("Selecting panel %d, session_field=%s, offset0=%#04x", panel, session_field.hex(), offset0)
-        video_bytes = _try_channel_wake(channel_sock, panel, session_field, offset0)
-        _LOGGER.debug("Channel offset0=%#04x -> %d bytes", offset0, video_bytes)
+        param1 = _extract_realplay_param1(login_resp)
+        offset0_sent = param1[0] if offset0 is None else offset0
+        source = "LOGIN" if offset0 is None else "rotation"
+        _LOGGER.debug("Selecting panel %d, param1=%s, offset0=%#04x (%s)", panel, param1.hex(), offset0_sent, source)
+        video_bytes = _try_channel_wake(channel_sock, panel, param1, offset0)
+        _LOGGER.debug("Channel offset0=%#04x -> %d bytes", offset0_sent, video_bytes)
         if video_bytes == 0:
-            return None
+            return None, offset0_sent
 
         for query in PRE_OPEN_QUERIES:
             control_sock.sendall(query)
@@ -384,9 +406,9 @@ def _attempt_open(host: str, port: int, panel: int, device_password: str, lock: 
         result_byte = open_resp[28]
         if result_byte == 0:
             _LOGGER.debug("Open command succeeded (result byte = 0x00)")
-            return True
+            return True, offset0_sent
         _LOGGER.warning("Open command possibly failed (result byte = %#04x)", result_byte)
-        return False
+        return False, offset0_sent
     finally:
         control_sock.close()
         channel_sock.close()
@@ -399,43 +421,46 @@ def open_door(
     """Run the full protocol (login, panel selection, wait for real video,
     open command) and return (success, offset0_used).
 
-    `offset0_start` should be the last value confirmed to work for this
-    specific panel (persisted by the caller -- see CONF_OFFSET0 in
-    const.py), falling back to CHANNEL_OFFSET0_CURRENT if none is known
-    yet. It is tried first; if the panel rejects it or the bus stays
-    silent, this rotates through the rest of CHANNEL_OFFSET0_RANGE, each
-    as a full independent attempt (own connections + own login) so every
-    candidate gets the identical, confirmed-good connection timing --
-    fail fast (success=False) only once every candidate has been tried
-    without waking the bus. `offset0_used` is the value that worked (the
-    caller should persist it if it differs from what it passed in), or
-    None if nothing woke the bus.
+    The first attempt sends param1 exactly as the LOGIN returned it
+    (CHANNEL_OFFSET0 included), like the native SDK. Only if the panel
+    rejects it or the bus stays silent does the safety net kick in: it
+    rotates CHANNEL_OFFSET0 through CHANNEL_OFFSET0_RANGE starting at
+    `offset0_start` (the last known-good value persisted by the caller --
+    see CONF_OFFSET0 in const.py -- or CHANNEL_OFFSET0_CURRENT), skipping
+    the value that just failed. Each candidate is a full independent
+    attempt (own connections + own login) so every candidate gets the
+    identical, confirmed-good connection timing -- fail fast
+    (success=False) only once every candidate has been tried without
+    waking the bus. `offset0_used` is the value that worked (the caller
+    should persist it if it differs from what it passed in), or None if
+    nothing woke the bus.
 
     This is a *blocking* call (plain sockets, several seconds of wait built
     in) -- callers running inside Home Assistant's event loop must run it
     via `hass.async_add_executor_job`.
     """
-    candidates = _offset0_candidates(offset0_start)
-
-    result = _attempt_open(host, port, panel, device_password, lock, candidates[0])
+    result, offset0_login = _attempt_open(host, port, panel, device_password, lock, None)
     if result is not None:
-        return result, candidates[0]
+        return result, offset0_login
+    if offset0_login is None:
+        return False, None
 
     _LOGGER.warning(
-        "offset0=%#04x was rejected or the bus stayed silent; trying other "
-        "values (each a full independent attempt).",
-        candidates[0],
+        "offset0=%#04x (from LOGIN) was rejected or the bus stayed silent; "
+        "trying other values (each a full independent attempt).",
+        offset0_login,
     )
-    for offset0 in candidates[1:]:
-        result = _attempt_open(host, port, panel, device_password, lock, offset0)
+    candidates = [c for c in _offset0_candidates(offset0_start) if c != offset0_login]
+    for offset0 in candidates:
+        result, _ = _attempt_open(host, port, panel, device_password, lock, offset0)
         if result is not None:
             _LOGGER.warning("Recovered using offset0=%#04x.", offset0)
             return result, offset0
 
     _LOGGER.error(
-        "Panel did not wake up for any candidate offset0 value (%s) -- the "
-        "accepted value likely moved outside this range; a fresh packet "
-        "capture is needed.",
+        "Panel did not wake up with the LOGIN value (%#04x) nor any "
+        "candidate (%s) -- a fresh packet capture is needed.",
+        offset0_login,
         ", ".join(f"{c:#04x}" for c in candidates),
     )
     return False, None
