@@ -25,47 +25,60 @@ Handshake, required before the panel accepts anything else:
      concatenated with ":" and the device password.
   3) PLACEHOLDER (52 bytes, static: 32 ASCII '0' characters).
 
-Selecting which door/panel to open (confirmed with Frida: syscall hooks
-with backtraces, real peer address and getsockname()):
+Waking the panel's bus (the "channel-select" / video-open step). This is
+a SECOND, independent TCP connection to the same host:port, opened
+concurrently with the control connection and BEFORE its login. It does
+NOT perform its own HELLO/LOGIN -- it goes straight to a 36-byte packet,
+type 0x0221.
 
-  - The app opens a SECOND, independent TCP connection to the same
-    host:port. That connection does NOT perform its own HELLO/LOGIN --
-    it goes straight to a 36-byte packet, type 0x0221.
-  - Body offset 4 (absolute offset 24) selects the panel: 0x00 = door 1,
-    0x01 = door 2. Confirmed 4/4 times across real captures.
-  - Body offset 0 (absolute offset 20) is currently 0x03 (confirmed via a
-    fresh real capture on 2026-09-26). An earlier session (months ago)
-    observed 0x02 as the accepted value instead -- the panel appears to
-    change its accepted value over time (possibly tied to a cloud
-    pairing/registration event), and there is no way to predict the next
-    one. Because of this, open_door() does not hardcode a single value:
-    it tries CHANNEL_OFFSET0_CURRENT first, and on rejection or on a
-    silent bus (accepted but no real video/audio follows) rotates through
-    CHANNEL_OFFSET0_FALLBACKS (the rest of 0x00-0x09) until one both gets
-    accepted AND the bus actually wakes up. If a fallback value is what
-    worked, a warning is logged naming it -- update
-    CHANNEL_OFFSET0_CURRENT to that value so future calls succeed on the
-    first try again. If the whole range is exhausted, open_door() fails
-    fast (returns False without attempting the open command) instead of
-    reporting a false "success" -- that scenario means the real value
-    moved outside 0x00-0x09 and needs a fresh packet capture to find.
-  - Body offset 2:4 (absolute 22:24) is NOT a local TCP port (ruled out
-    with a real getsockname()): it is a literal copy of the 2-byte field
-    at offset 318 of the CONTROL connection's LOGIN response (right
-    before the ASCII string "DVR" that appears there). Without this
-    field the panel rejects the packet with status=0x06; with it,
-    status=0x00.
-  - Body offset 10:12 (absolute 30:32) remains unexplained -- not a
-    port, not present in the LOGIN response or the challenge, and no
-    CRC16/checksum tried over the packet matches it. Left at 0x0000;
-    the panel accepts the command regardless.
-  - Even a status=0x00 accept is not enough on its own: the outdoor
-    unit sits on an internal bus that is not always "awake". Real
-    video/audio starts flowing over this same second connection a few
-    seconds later (tens of KB: an H264 keyframe followed by shrinking P
-    frames) once the bus really wakes that panel up. Only then does the
-    door-open command on the control connection actually drive the
-    physical relay.
+What that packet actually is (confirmed by disassembling the app's native
+libNewAllStreamParser.so, arm64, 2026-09-27): it is the UMSP ("UMeye
+Streaming Protocol") message
+    NPC_F_PVM_UMSP_PRO_SendProData_P2_EX_REALPLAY_OPEN
+i.e. the "open live video (realplay)" request. Its native signature is
+(conn, uint32, uint16, uint16, uint32), which maps onto the 16-byte body
+as four fields:
+
+  - body[0:4]  = param1 (uint32) = (session_field << 16) | 0x0003
+      * The low byte, body[0] (absolute offset 20), is CHANNEL_OFFSET0.
+        It is the low byte of the realplay-open stream parameter -- NOT a
+        registered-client index or a device id, despite once looking like
+        one. Its value is currently 0x03; a capture from months ago had
+        0x02, and the panel now rejects 0x02 with status=0x06. The exact
+        meaning of the 2-vs-3 enum was not fully resolved from the caller;
+        the most plausible reading is a media bitmask (bit0=video,
+        bit1=audio -> 0x03 = video+audio, consistent with H264 *and* G711
+        both arriving on this connection), but that is a hypothesis, not
+        confirmed. Whether the change was triggered by an app update
+        (recompiled constant) or a panel firmware change is unknown.
+      * The high 2 bytes, body[2:4] (absolute 22:24), are SESSION_FIELD:
+        a literal copy of the 2-byte field at offset 318 of the CONTROL
+        connection's LOGIN response (right before the ASCII "DVR"). This
+        is what binds this unauthenticated connection to the logged-in
+        session. Without it the panel rejects with status=0x06.
+  - body[4:6]  = param2 (uint16) = channel/panel: 0x0000 = door 1,
+    0x0001 = door 2. body[4] is PANEL_CHANNEL_OFFSET. Confirmed 4/4.
+  - body[6:8]  = param3 (uint16) = fixed 0x0001.
+  - body[8:12] = param4 (uint32) = fixed 0x00000001.
+  - body[12:16] are 0 in the request; the panel fills them in its reply
+    (04 00 <2 bytes>, apparently a media-session id/port it assigns).
+
+Because the CHANNEL_OFFSET0 value has already shifted once (0x02 -> 0x03)
+and may shift again, open_door() does not trust a single hardcoded value:
+it tries the last known-good one first (persisted per config entry, see
+CONF_OFFSET0), and on rejection or a silent bus (accepted but no real
+video/audio follows) rotates through the rest of CHANNEL_OFFSET0_RANGE
+until one both gets accepted AND wakes the bus. If the whole range is
+exhausted it fails fast (returns success=False WITHOUT sending the open
+command) rather than reporting a false "success" -- that means the real
+value moved outside 0x00-0x09 and needs a fresh packet capture.
+
+A status=0x00 accept is not enough on its own: the outdoor unit sits on
+an internal bus that is not always "awake". Real video/audio starts
+flowing over this same second connection a few seconds later (tens of KB:
+an H264 keyframe followed by shrinking P frames) once the bus really
+wakes that panel up. Only then does the door-open command on the control
+connection actually drive the physical relay.
 
 Then, on the control connection: a handful of "pre-open" queries copied
 verbatim from a real session (not confirmed as strictly required, but
@@ -97,9 +110,10 @@ PLACEHOLDER_52 = bytes.fromhex(
 )
 assert len(PLACEHOLDER_52) == 52, len(PLACEHOLDER_52)
 
-# Channel-select packet (type 0x0221). See module docstring for the
-# meaning of each field. CHANNEL_TYPE_OFFSET, PANEL_CHANNEL_OFFSET and
-# SESSION_FIELD_OFFSET are absolute offsets into this 36-byte packet.
+# UMSP EX_REALPLAY_OPEN packet (type 0x0221). See the module docstring for
+# the full field breakdown recovered from the native library.
+# CHANNEL_TYPE_OFFSET, PANEL_CHANNEL_OFFSET and SESSION_FIELD_OFFSET are
+# absolute offsets into this 36-byte packet.
 VIDEO_START_36_TEMPLATE = bytearray.fromhex(
     "eeeeffff2400000021020000000000000000000003000000000001000100000000000000"
 )
@@ -108,12 +122,12 @@ CHANNEL_TYPE_OFFSET = 20
 PANEL_CHANNEL_OFFSET = 24
 SESSION_FIELD_OFFSET = 22
 
-# See the docstring section above ("Body offset 0 ..."): the panel's
-# accepted value at this offset has changed once already (0x02 -> 0x03)
-# and may change again. CHANNEL_OFFSET0_CURRENT is the hardcoded default
-# used when a config entry hasn't discovered/persisted its own value yet
-# (see CONF_OFFSET0 in const.py); CHANNEL_OFFSET0_RANGE is the full space
-# open_door() rotates through.
+# CHANNEL_OFFSET0 = low byte of the realplay-open stream parameter (see
+# docstring). The panel's accepted value has changed once already
+# (0x02 -> 0x03) and may change again. CHANNEL_OFFSET0_CURRENT is the
+# hardcoded default used when a config entry hasn't discovered/persisted
+# its own value yet (see CONF_OFFSET0 in const.py); CHANNEL_OFFSET0_RANGE
+# is the full space open_door() rotates through.
 CHANNEL_OFFSET0_CURRENT = 0x03
 CHANNEL_OFFSET0_RANGE = tuple(range(0x00, 0x0A))
 CHANNEL_WAKE_TIMEOUT = 8.0

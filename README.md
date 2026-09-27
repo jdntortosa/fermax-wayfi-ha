@@ -72,19 +72,28 @@ in the logs): the panel never had its relay fire, so this integration
 refuses to report a false "success".
 
 The most likely cause: the panel occasionally changes a single protocol
-byte it requires in the channel-select packet (seen once so far, `0x02`
-→ `0x03`). **Why it changes is not confirmed.** The leading hypothesis —
-untested, just a plausible correlation — is that it's tied to the number
-of client devices/apps registered on the panel (the change coincided
-with pairing a new phone on the same panel that day), but this could
-just as easily be firmware-side and unrelated; no vendor documentation
-or disassembly has confirmed either way. Since v0.8 the integration
-handles this defensively regardless of the real cause: it tries the last
-known-good value first (persisted per config entry, so no code changes
-or manual steps are needed — see a `WARNING` in the logs if it ever has
-to rediscover it) and, if rejected, rotates through a small range of
-candidates until the panel's outdoor unit actually wakes up (real
-video/audio flowing, not just a protocol ACK).
+byte it requires when opening the live video stream (seen once so far,
+`0x02` → `0x03`), which makes it reject the stream-open with `status=0x06`
+and never wake its outdoor bus.
+
+What that byte actually is (recovered by disassembling the app's native
+`libNewAllStreamParser.so`): the packet is the UMSP ("UMeye Streaming
+Protocol") `EX_REALPLAY_OPEN` message — the "open live video" request —
+and the byte is the **low byte of that request's first stream parameter**
+(its high half carries the session token from login). So it is a
+video-stream flag, *not* a per-client or per-device registration index.
+The exact meaning of the `2`-vs-`3` value wasn't fully pinned down; the
+most plausible reading is a media bitmask (bit0=video, bit1=audio →
+`0x03` = video+audio, which matches the H.264 **and** G.711 audio that
+both arrive on this connection), but that's a hypothesis. Whether the
+change was triggered by an app update or panel firmware is unknown.
+
+Since v0.8 the integration handles this defensively regardless of the
+cause: it tries the last known-good value first (persisted per config
+entry, so no code changes or manual steps are needed — see a `WARNING`
+in the logs if it ever has to rediscover it) and, if rejected, rotates
+through a small range of candidates until the panel's outdoor unit
+actually wakes up (real video/audio flowing, not just a protocol ACK).
 
 If the button still fails after that (every candidate rejected), the
 panel likely moved the accepted value outside the built-in range — please
