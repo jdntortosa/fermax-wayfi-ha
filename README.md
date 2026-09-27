@@ -71,29 +71,22 @@ If a door button fails, Home Assistant shows the error directly (not just
 in the logs): the panel never had its relay fire, so this integration
 refuses to report a false "success".
 
-The most likely cause: the panel occasionally changes a single protocol
-byte it requires when opening the live video stream (seen once so far,
-`0x02` → `0x03`), which makes it reject the stream-open with `status=0x06`
-and never wake its outdoor bus.
+How the stream-open works (recovered from the official, symbol-bearing
+UMEye SDK's `libNewAllStreamParser.so`): the packet that wakes the outdoor
+unit is the UMSP ("UMeye Streaming Protocol") `EX_REALPLAY_OPEN` message —
+the "open live video" request — and its first parameter is a
+**panel-assigned session id that the panel sends in every LOGIN response**
+(4 bytes at offset 316). The integration copies it verbatim, exactly like
+the official app. Its low byte once changed on the panel side (`0x02` →
+`0x03`, apparently when a new phone was paired); since v1.0.0 that is
+handled automatically because the value is no longer hardcoded.
 
-What that byte actually is (recovered by disassembling the app's native
-`libNewAllStreamParser.so`): the packet is the UMSP ("UMeye Streaming
-Protocol") `EX_REALPLAY_OPEN` message — the "open live video" request —
-and the byte is the **low byte of that request's first stream parameter**
-(its high half carries the session token from login). So it is a
-video-stream flag, *not* a per-client or per-device registration index.
-The exact meaning of the `2`-vs-`3` value wasn't fully pinned down; the
-most plausible reading is a media bitmask (bit0=video, bit1=audio →
-`0x03` = video+audio, which matches the H.264 **and** G.711 audio that
-both arrive on this connection), but that's a hypothesis. Whether the
-change was triggered by an app update or panel firmware is unknown.
-
-Since v0.8 the integration handles this defensively regardless of the
-cause: it tries the last known-good value first (persisted per config
-entry, so no code changes or manual steps are needed — see a `WARNING`
-in the logs if it ever has to rediscover it) and, if rejected, rotates
-through a small range of candidates until the panel's outdoor unit
-actually wakes up (real video/audio flowing, not just a protocol ACK).
+As a safety net (in case a future firmware changes the LOGIN layout), if
+the panel still rejects the stream-open or its outdoor unit doesn't wake
+up (no real video/audio flowing, not just a protocol ACK), the
+integration rotates that byte through a small range of candidates,
+starting at the last known-good value persisted per config entry — look
+for a `WARNING` in the logs if that ever happens.
 
 If the button still fails after that (every candidate rejected), the
 panel likely moved the accepted value outside the built-in range — please
