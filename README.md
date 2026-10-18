@@ -25,11 +25,11 @@ for the full protocol writeup and the exact byte offsets involved.
 - There is **no state**: this protocol has no way to read back whether a
   door is currently open — a `button` is the honest representation, not
   a `lock` pretending to know something it doesn't.
-- Each press takes roughly 10 seconds: the panel's outdoor unit sits on
-  an internal bus that isn't always awake, and this integration has to
-  wait for real video/audio to start flowing before the open command
-  actually reaches the physical relay (see the protocol docstring for
-  why).
+- Each press takes a few seconds: the panel's outdoor unit sits on an
+  internal bus that isn't always awake, and this integration has to wait
+  for real video to start flowing before the open command actually
+  reaches the physical relay (it opens 1 s after the first video packet,
+  8 s at most; see the protocol docstring for why).
 
 ## Installation
 

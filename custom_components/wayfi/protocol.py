@@ -80,14 +80,18 @@ an internal bus that is not always "awake". Real video/audio starts
 flowing over this same second connection a few seconds later (tens of KB:
 an H264 keyframe followed by shrinking P frames) once the bus really
 wakes that panel up. Only then does the door-open command on the control
-connection actually drive the physical relay.
+connection actually drive the physical relay. There is no need to wait
+for the whole stream: open_door() reads framed packets and sends the open
+command CHANNEL_WAKE_MARGIN after the first video packet (type 0x0e01),
+with CHANNEL_WAKE_TIMEOUT as the upper bound.
 
 Then, on the control connection: a handful of "pre-open" queries copied
 verbatim from a real session (not confirmed as strictly required, but
 included because the panel accepts the open command reliably with them),
 followed by the open command itself: TLV cmd=2046 ("open lock"), 36-byte
 body = 00 00 lockNum 00 + device_password(15 bytes ASCII, zero-padded) +
-17 zero bytes.
+17 zero bytes. Its result byte is 0x00 on success, or 0x05 when a call is
+in progress (the door still opens, so it is treated as success too).
 """
 
 from __future__ import annotations
@@ -132,7 +136,19 @@ PANEL_CHANNEL_OFFSET = 24
 # LOGIN value is rejected or the bus stays silent.
 CHANNEL_OFFSET0_CURRENT = 0x03
 CHANNEL_OFFSET0_RANGE = tuple(range(0x00, 0x0A))
+# Upper bound for waiting on the channel before the open command.
 CHANNEL_WAKE_TIMEOUT = 8.0
+# Extra reading after the first video packet: once video flows the bus is
+# awake and the open is immediate. Tuned on the physical door (same value
+# as the wayfi-app mobile client).
+CHANNEL_WAKE_MARGIN = 1.0
+RESPONSE_TIMEOUT = 5.0
+# The vendor app doesn't require answers to the pre-open queries; waiting
+# longer only stalls the open when the panel doesn't reply (e.g. mid-call).
+PRE_OPEN_QUERY_TIMEOUT = 1.5
+
+HEADER_LEN = 20
+TYPE_VIDEO = 0x0E01
 
 
 def _offset0_candidates(start: int) -> list[int]:
@@ -145,6 +161,9 @@ def _offset0_candidates(start: int) -> list[int]:
     return candidates
 
 CMD_OPEN_LOCK = 2046
+# Open result while a call is in progress. Verified live: the door still
+# opens (a bit later), and the vendor app doesn't check it either.
+OPEN_RESULT_DURING_CALL = 0x05
 
 # Pre-open queries the real app sends on the control connection, byte for
 # byte identical regardless of which door was selected.
@@ -221,6 +240,36 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes:
             raise WayfiConnectionError(f"connection closed, expected {n} bytes, got {len(buf)}")
         buf += chunk
     return buf
+
+
+def _recv_exact_before(sock: socket.socket, n: int, deadline: float) -> bytes:
+    """Like _recv_exact(), but gives up (socket.timeout) at `deadline`
+    (time.monotonic()) instead of per recv() call.
+    """
+    buf = b""
+    while len(buf) < n:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise socket.timeout("deadline reached")
+        sock.settimeout(remaining)
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise WayfiConnectionError(f"connection closed, expected {n} bytes, got {len(buf)}")
+        buf += chunk
+    return buf
+
+
+def _recv_packet(sock: socket.socket, deadline: float) -> bytes:
+    """Read one whole framed packet (header + body) before `deadline`."""
+    header = _recv_exact_before(sock, HEADER_LEN, deadline)
+    total_len = struct.unpack_from("<I", header, 4)[0]
+    if header[:4] != MAGIC or total_len < HEADER_LEN:
+        raise WayfiConnectionError(f"malformed packet header: {header.hex()}")
+    return header + _recv_exact_before(sock, total_len - HEADER_LEN, deadline)
+
+
+def _packet_type(packet: bytes) -> int:
+    return struct.unpack_from("<H", packet, 8)[0]
 
 
 def _frame_header(total_len: int, type_bytes: bytes, is_response: bool, nonce: int = 0) -> bytes:
@@ -319,31 +368,33 @@ def test_connection(host: str, port: int, device_password: str) -> None:
         sock.close()
 
 
-def _try_channel_wake(channel_sock: socket.socket, panel: int, param1: bytes, offset0: int | None) -> int:
+def _try_channel_wake(channel_sock: socket.socket, panel: int, param1: bytes, offset0: int | None) -> bool:
     """Send a channel-select packet on an already-open `channel_sock` and
-    wait for real video/audio to confirm the bus woke up. Returns the
-    number of bytes received (0 = rejected or bus stayed silent).
+    wait for real video to confirm the bus woke up: reads until
+    CHANNEL_WAKE_MARGIN after the first video packet, capped at
+    CHANNEL_WAKE_TIMEOUT. Returns whether video arrived (False = rejected
+    or bus stayed silent).
     """
     channel_sock.sendall(build_video_start(panel, param1, offset0))
     try:
-        channel_resp = channel_sock.recv(4096)
-    except socket.timeout:
-        return 0
-    if len(channel_resp) < 12 or channel_resp[11] != 0:
-        return 0
+        channel_resp = _recv_packet(channel_sock, time.monotonic() + RESPONSE_TIMEOUT)
+    except (socket.timeout, WayfiConnectionError):
+        return False
+    if channel_resp[11] != 0:
+        return False
 
-    channel_sock.settimeout(CHANNEL_WAKE_TIMEOUT)
-    total_channel_bytes = 0
-    deadline = time.time() + CHANNEL_WAKE_TIMEOUT
-    while time.time() < deadline:
+    wake_limit = time.monotonic() + CHANNEL_WAKE_TIMEOUT
+    deadline = wake_limit
+    got_video = False
+    while time.monotonic() < deadline:
         try:
-            chunk = channel_sock.recv(4096)
-            if not chunk:
-                break
-            total_channel_bytes += len(chunk)
-        except socket.timeout:
+            packet = _recv_packet(channel_sock, deadline)
+        except (socket.timeout, WayfiConnectionError):
             break
-    return total_channel_bytes
+        if not got_video and _packet_type(packet) == TYPE_VIDEO:
+            got_video = True
+            deadline = min(time.monotonic() + CHANNEL_WAKE_MARGIN, wake_limit)
+    return got_video
 
 
 def _attempt_open(
@@ -390,23 +441,28 @@ def _attempt_open(
         offset0_sent = param1[0] if offset0 is None else offset0
         source = "LOGIN" if offset0 is None else "rotation"
         _LOGGER.debug("Selecting panel %d, param1=%s, offset0=%#04x (%s)", panel, param1.hex(), offset0_sent, source)
-        video_bytes = _try_channel_wake(channel_sock, panel, param1, offset0)
-        _LOGGER.debug("Channel offset0=%#04x -> %d bytes", offset0_sent, video_bytes)
-        if video_bytes == 0:
+        got_video = _try_channel_wake(channel_sock, panel, param1, offset0)
+        _LOGGER.debug("Channel offset0=%#04x -> video=%s", offset0_sent, got_video)
+        if not got_video:
             return None, offset0_sent
 
+        control_sock.settimeout(PRE_OPEN_QUERY_TIMEOUT)
         for query in PRE_OPEN_QUERIES:
             control_sock.sendall(query)
             try:
                 control_sock.recv(4096)
             except socket.timeout:
                 _LOGGER.warning("Pre-open query got no response (timeout)")
+        control_sock.settimeout(RESPONSE_TIMEOUT)
 
         control_sock.sendall(_build_open_packet(lock, device_password))
         open_resp = _recv_exact(control_sock, 29)
         result_byte = open_resp[28]
         if result_byte == 0:
             _LOGGER.debug("Open command succeeded (result byte = 0x00)")
+            return True, offset0_sent
+        if result_byte == OPEN_RESULT_DURING_CALL:
+            _LOGGER.debug("Open command accepted during a call (result byte = %#04x)", result_byte)
             return True, offset0_sent
         _LOGGER.warning("Open command possibly failed (result byte = %#04x)", result_byte)
         return False, offset0_sent
