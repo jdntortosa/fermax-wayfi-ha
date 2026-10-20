@@ -19,7 +19,7 @@ from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import CONF_NUM_DOORS, CONF_OFFSET0, CONF_PIN, DEFAULT_PORT, DOMAIN, LOCK_CANDADO
-from .protocol import CHANNEL_OFFSET0_CURRENT, derive_device_password, open_door
+from .protocol import CHANNEL_OFFSET0_CURRENT, WayfiConnectionError, derive_device_password, open_door
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -66,9 +66,14 @@ class WayfiDoorButton(ButtonEntity):
     async def async_press(self) -> None:
         """Open this door."""
         offset0_start = self._entry.data.get(CONF_OFFSET0, CHANNEL_OFFSET0_CURRENT)
-        success, offset0_used = await self.hass.async_add_executor_job(
-            open_door, self._host, DEFAULT_PORT, self._panel, self._device_password, LOCK_CANDADO, offset0_start
-        )
+        try:
+            success, offset0_used = await self.hass.async_add_executor_job(
+                open_door, self._host, DEFAULT_PORT, self._panel, self._device_password, LOCK_CANDADO, offset0_start
+            )
+        except (OSError, WayfiConnectionError) as err:
+            raise HomeAssistantError(
+                f"No se pudo comunicar con el panel en {self._host} para abrir la puerta {self._door_number}: {err}"
+            ) from err
         if offset0_used is not None and offset0_used != offset0_start:
             # The panel's accepted channel-select byte moved -- persist it
             # on the config entry so the NEXT press (either door) starts

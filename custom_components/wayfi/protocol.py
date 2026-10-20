@@ -420,14 +420,13 @@ def _attempt_open(
     packet actually carried (None if it was never sent).
     """
     control_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    control_sock.settimeout(5.0)
-    control_sock.connect((host, port))
-
     channel_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    channel_sock.settimeout(5.0)
-    channel_sock.connect((host, port))
-
     try:
+        control_sock.settimeout(5.0)
+        control_sock.connect((host, port))
+        channel_sock.settimeout(5.0)
+        channel_sock.connect((host, port))
+
         try:
             login_resp = _perform_login(control_sock, device_password)
         except WayfiConnectionError as exc:
